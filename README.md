@@ -48,6 +48,17 @@
 
 > 首次刷入后安装 [SukiSU Ultra Manager](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)（版本号与内核驱动精确匹配，无版本警告）。
 
+## 🌐 模块 WebUI 说明
+
+**ReSukiSU 4.x 内核不包含 WebUI 服务**（`CONFIG_KSU_WEBUI` 选项在该版本不存在，ksud 亦无 webui 服务），因此模块卡片上的 `< >` WebUI 按钮不会响应。这**不影响任何模块功能**（PIF / TrickyStore / susfs 等均可通过配置文件管理）。
+
+如需打开模块图形界面（ZygiskNext / PIF / TrickyStore / Integrity-Box 等均自带 `webroot`），请使用用户态方案：
+
+- **[MMRL](https://github.com/Googoolip/MMRL/releases)**（推荐）— 模块管理器，直接读取并托管模块 `webroot`，无需内核 WebUI 支持
+- **[KsuWebUI](https://github.com/backslashxx/KsuWebUI/releases)** — 通用 WebUI 启动器
+
+> 若后续 ReSukiSU/SukiSU-Ultra 内核版本加入 WebUI 支持，本仓库将同步跟进。
+
 ## 🛠️ 本地构建
 
 ```bash
