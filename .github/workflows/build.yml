@@ -58,6 +58,24 @@ jobs:
           cd kernel
           git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
           git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
+                    python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("drivers/input/input.c")
+          s = p.read_text()
+          old_decl = "extern bool ksu_input_hook __read_mostly;"
+          new_decl = "extern struct static_key_true ksu_is_input_hook_enabled;"
+          old_cond = "if (unlikely(ksu_input_hook))"
+          new_cond = "if (static_branch_unlikely(&ksu_is_input_hook_enabled))"
+
+          if s.count(old_decl) != 1 or s.count(old_cond) != 1:
+              raise SystemExit("ERROR: input hook source does not match expected layout")
+
+          s = s.replace(old_decl, new_decl, 1)
+          s = s.replace(old_cond, new_cond, 1)
+          p.write_text(s)
+          print("Updated input hook successfully")
+          PY
           test ! -e drivers/kernelsu
           ln -s "$GITHUB_WORKSPACE/resukisu/kernel" drivers/kernelsu
 
