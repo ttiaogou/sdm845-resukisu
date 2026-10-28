@@ -1,4 +1,4 @@
-name: Build ReSukiSU Kernel (Android 13 / equuleus)
+name: Build ReSukiSU Kernel (LineageOS 20 / equuleus)
 
 on:
   workflow_dispatch:
@@ -12,13 +12,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      KERNEL_BRANCH: lineageos-20-ksu-backup
-      KERNEL_REPO: Coconutat/android_kernel_xiaomi_sdm845_lineageos_Exp
+      KERNEL_BRANCH: lineage-20
+      KERNEL_REPO: LineageOS/android_kernel_xiaomi_sdm845
       RESUKISU_REPO: ReSukiSU/ReSukiSU
       DEVICE: equuleus
 
     steps:
-      - name: Checkout build scripts
+      - name: Checkout build configuration
         uses: actions/checkout@v4
 
       - name: Install build dependencies
@@ -32,137 +32,44 @@ jobs:
           git clone --depth=1 https://github.com/PixelExperience/prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc-aarch64
           git clone --depth=1 https://github.com/PixelExperience/prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc-arm
 
-      - name: Clone Android 13 kernel base
+      - name: Clone official LineageOS 20 kernel
         run: |
           git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" "https://github.com/$KERNEL_REPO.git" kernel
           cd kernel
           grep -q '^VERSION = 4' Makefile
           grep -q '^PATCHLEVEL = 9' Makefile
-          grep -q '^SUBLEVEL = 337' Makefile
+          test -s arch/arm64/configs/vendor/xiaomi/mi845_defconfig
           test -s arch/arm64/configs/vendor/xiaomi/equuleus.config
           echo "Kernel source commit: $(git rev-parse HEAD)"
+          make -s kernelversion
 
       - name: Clone ReSukiSU
         run: |
           git clone --depth=1 "https://github.com/$RESUKISU_REPO.git" resukisu
           echo "ReSukiSU source commit: $(git -C resukisu rev-parse HEAD)"
 
-      - name: Prepare LOS20-compatible patch
+      - name: Apply existing ReSukiSU/SUSFS patch
         run: |
-          python3 -m py_compile scripts/prepare-lineage20-patch.py
-          python3 scripts/prepare-lineage20-patch.py \
-            patches/0001-resukisu-susfs-sdm845.patch \
-            "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-
-      - name: Apply patch and configure equuleus
-        run: |
+          test -s patches/0001-resukisu-susfs-sdm845.patch
           cd kernel
-          git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-          git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-
-          # Existing compatibility helper injection retained as-is from the current workflow.
-          python3 - <<'PY'
-          from pathlib import Path
-
-          header = Path("include/linux/susfs_def.h")
-          text = header.read_text(encoding="utf-8")
-          anchor = "#define TIF_PROC_UMOUNTED 33"
-          required = (
-              "susfs_is_current_proc_no_su",
-              "susfs_set_current_proc_no_su",
-              "susfs_clear_current_proc_no_su",
-              "susfs_set_current_proc_umounted_for_zygote_next",
-          )
-
-          if all(name in text for name in required):
-              print("SUSFS thread-flag helpers already exist; no compatibility edit needed")
-          else:
-              if any(name in text for name in required):
-                  raise SystemExit("ERROR: only some SUSFS helpers exist; refusing partial injection")
-              if text.count(anchor) != 1:
-                  raise SystemExit("ERROR: cannot uniquely locate TIF_PROC_UMOUNTED in susfs_def.h")
-              compatibility = r"""
-          #ifndef TIF_PROC_NO_SU
-          #define TIF_PROC_NO_SU 32
-          #endif
-          #ifndef TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT
-          #define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 34
-          #endif
-
-          static inline bool susfs_is_current_proc_no_su(void)
-          {
-              return test_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
-          }
-
-          static inline void susfs_set_current_proc_no_su(void)
-          {
-              set_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
-          }
-
-          static inline void susfs_clear_current_proc_no_su(void)
-          {
-              clear_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
-          }
-
-          static inline void susfs_set_current_proc_umounted_for_zygote_next(void)
-          {
-              set_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
-          }
-          """
-              compatibility = "\n".join(
-                  line[10:] if line.startswith("          ") else line
-                  for line in compatibility.splitlines()
-              ) + "\n"
-              text = text.replace(anchor, anchor + compatibility, 1)
-              header.write_text(text, encoding="utf-8")
-              print("Added missing SUSFS thread-flag compatibility helpers")
-
-          for name in required:
-              if name not in header.read_text(encoding="utf-8"):
-                  raise SystemExit(f"ERROR: SUSFS helper still missing: {name}")
-          PY
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          p = Path("drivers/input/input.c")
-          s = p.read_text()
-          old_decl = "extern bool ksu_input_hook __read_mostly;"
-          new_decl = "extern struct static_key_true ksu_is_input_hook_enabled;"
-          old_cond = "if (unlikely(ksu_input_hook))"
-          new_cond = "if (static_branch_unlikely(&ksu_is_input_hook_enabled))"
-          jump_include = "#include <linux/jump_label.h>"
-          include_anchor = "#include <linux/input/mt.h>"
-
-          if old_decl in s and old_cond in s:
-              if s.count(old_decl) != 1 or s.count(old_cond) != 1:
-                  raise SystemExit("ERROR: input hook source has an unexpected layout")
-              s = s.replace(old_decl, new_decl, 1)
-              s = s.replace(old_cond, new_cond, 1)
-              if jump_include not in s:
-                  if s.count(include_anchor) != 1:
-                      raise SystemExit("ERROR: cannot locate input header include anchor")
-                  s = s.replace(include_anchor, include_anchor + "\n" + jump_include, 1)
-              p.write_text(s)
-              print("Updated input hook and jump-label include successfully")
-          elif new_decl in s and new_cond in s and jump_include in s:
-              print("Input hook compatibility change already present")
-          else:
-              raise SystemExit("ERROR: input hook source does not match expected layout")
-          PY
-
+          # Fail clearly if the existing project patch does not match the official LOS20 tree.
+          git apply --check ../patches/0001-resukisu-susfs-sdm845.patch
+          git apply ../patches/0001-resukisu-susfs-sdm845.patch
           test ! -e drivers/kernelsu
           ln -s "$GITHUB_WORKSPACE/resukisu/kernel" drivers/kernelsu
 
+      - name: Generate equuleus defconfig
+        run: |
+          cd kernel
           cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig > arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
           cat arch/arm64/configs/vendor/xiaomi/${DEVICE}.config >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
           cat >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig <<'EOF'
-          # ReSukiSU + SUSFS: KSU_SUSFS is a mutually exclusive KSU hooking choice on this tree.
+          # ReSukiSU + SUSFS (retain current project configuration)
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           EOF
 
-      - name: Configure and verify required options
+      - name: Configure and verify KSU/SUSFS
         run: |
           cd kernel
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
@@ -173,15 +80,13 @@ jobs:
           export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
           make O=out ARCH=arm64 vendor/xiaomi/${DEVICE}_defconfig CC=clang
-
-          echo "===== KSU/SUSFS configuration ====="
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_[A-Z0-9_]+|# CONFIG_KSU_[A-Z0-9_]+ is not set)' out/.config || true
           grep -qx 'CONFIG_KSU=y' out/.config
           grep -qx 'CONFIG_KSU_SUSFS=y' out/.config
           if grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
-            echo "ERROR: KSU_MANUAL_HOOK and KSU_SUSFS are mutually exclusive in this Kconfig choice."
+            echo "ERROR: KSU_MANUAL_HOOK conflicts with this project's KSU_SUSFS configuration."
             exit 1
           fi
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_SUSFS)' out/.config || true
 
       - name: Build kernel
         run: |
@@ -196,13 +101,12 @@ jobs:
           test -s out/arch/arm64/boot/Image.gz-dtb
           ls -lh out/arch/arm64/boot/Image.gz-dtb
 
-      - name: Package equuleus AnyKernel3 ZIP
+      - name: Package equuleus AnyKernel3 ZIP (unchanged flash format)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel3
           rm -rf anykernel3/.git
           cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel3/Image.gz-dtb
 
-          # Normalize device and partition properties, then reject unrelated template residue.
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -232,7 +136,6 @@ jobs:
               raise SystemExit("ERROR: BLOCK property not found; refusing to guess partition path")
           s = re.sub(r"(?m)^BLOCK=.*;$", "BLOCK=auto;", s, count=1)
 
-          # Remove template-only tuna ramdisk editing section if present.
           start = s.find("# init.tuna.rc")
           if start != -1:
               end = s.find("write_boot;", start)
