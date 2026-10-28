@@ -58,6 +58,80 @@ jobs:
           cd kernel
           git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
           git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
+
+          # The bundled SUSFS patch predates helper flags required by this
+          # ReSukiSU revision. Add the missing helpers as inline thread-flag
+          # functions for this arm64 Linux 4.9 tree.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          header = Path("include/linux/susfs_def.h")
+          text = header.read_text(encoding="utf-8")
+          anchor = "#define TIF_PROC_UMOUNTED 33"
+
+          required = (
+              "susfs_is_current_proc_no_su",
+              "susfs_set_current_proc_no_su",
+              "susfs_clear_current_proc_no_su",
+              "susfs_set_current_proc_umounted_for_zygote_next",
+          )
+
+          if all(name in text for name in required):
+              print("SUSFS thread-flag helpers already exist; no compatibility edit needed")
+          else:
+              if any(name in text for name in required):
+                  raise SystemExit(
+                      "ERROR: include/linux/susfs_def.h contains only some SUSFS "
+                      "thread-flag helpers; refusing to add a duplicate/partial block"
+                  )
+              if text.count(anchor) != 1:
+                  raise SystemExit(
+                      "ERROR: cannot uniquely locate TIF_PROC_UMOUNTED in susfs_def.h"
+                  )
+
+              compatibility = r"""
+
+          #ifndef TIF_PROC_NO_SU
+          #define TIF_PROC_NO_SU 32
+          #endif
+          #ifndef TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT
+          #define TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT 34
+          #endif
+
+          static inline bool susfs_is_current_proc_no_su(void)
+          {
+              return test_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
+          }
+
+          static inline void susfs_set_current_proc_no_su(void)
+          {
+              set_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
+          }
+
+          static inline void susfs_clear_current_proc_no_su(void)
+          {
+              clear_ti_thread_flag(&current->thread_info, TIF_PROC_NO_SU);
+          }
+
+          static inline void susfs_set_current_proc_umounted_for_zygote_next(void)
+          {
+              set_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
+          }
+          """
+              # Dedent the embedded block's outer indentation while preserving C indentation.
+              compatibility = "\n".join(
+                  line[10:] if line.startswith("          ") else line
+                  for line in compatibility.splitlines()
+              ) + "\n"
+              text = text.replace(anchor, anchor + compatibility, 1)
+              header.write_text(text, encoding="utf-8")
+              print("Added missing SUSFS thread-flag compatibility helpers")
+
+          for name in required:
+              if name not in header.read_text(encoding="utf-8"):
+                  raise SystemExit(f"ERROR: SUSFS helper still missing: {name}")
+          PY
+
           python3 - <<'PY'
           from pathlib import Path
 
@@ -70,17 +144,23 @@ jobs:
           jump_include = "#include <linux/jump_label.h>"
           include_anchor = "#include <linux/input/mt.h>"
 
-          if s.count(old_decl) != 1 or s.count(old_cond) != 1:
+          if old_decl in s and old_cond in s:
+              if s.count(old_decl) != 1 or s.count(old_cond) != 1:
+                  raise SystemExit("ERROR: input hook source has an unexpected layout")
+              s = s.replace(old_decl, new_decl, 1)
+              s = s.replace(old_cond, new_cond, 1)
+              if jump_include not in s:
+                  if s.count(include_anchor) != 1:
+                      raise SystemExit("ERROR: cannot locate input header include anchor")
+                  s = s.replace(include_anchor, include_anchor + "\n" + jump_include, 1)
+              p.write_text(s)
+              print("Updated input hook and jump-label include successfully")
+          elif new_decl in s and new_cond in s and jump_include in s:
+              print("Input hook compatibility change already present")
+          else:
               raise SystemExit("ERROR: input hook source does not match expected layout")
-          s = s.replace(old_decl, new_decl, 1)
-          s = s.replace(old_cond, new_cond, 1)
-          if jump_include not in s:
-              if s.count(include_anchor) != 1:
-                  raise SystemExit("ERROR: cannot locate input header include anchor")
-              s = s.replace(include_anchor, include_anchor + "\n" + jump_include, 1)
-          p.write_text(s)
-          print("Updated input hook and jump-label include successfully")
           PY
+
           test ! -e drivers/kernelsu
           ln -s "$GITHUB_WORKSPACE/resukisu/kernel" drivers/kernelsu
 
@@ -101,12 +181,15 @@ jobs:
           export CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc-arm/bin/arm-linux-androideabi-"
           export LLVM=1 LLVM_IAS=1
           export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+
           make O=out ARCH=arm64 vendor/xiaomi/${DEVICE}_defconfig CC=clang
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_SUS_PATH|CONFIG_KSU_SUSFS_SUS_MOUNT|CONFIG_KSU_SUSFS_SUS_KSTAT|CONFIG_KSU_SUSFS_SPOOF_UNAME)=' out/.config || true
+
+          echo "===== KSU/SUSFS configuration ====="
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_[A-Z0-9_]+|# CONFIG_KSU_[A-Z0-9_]+ is not set)' out/.config || true
           grep -qx 'CONFIG_KSU=y' out/.config
           grep -qx 'CONFIG_KSU_SUSFS=y' out/.config
           if grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
-            echo 'ERROR: KSU_MANUAL_HOOK and KSU_SUSFS are mutually exclusive in this Kconfig choice.'
+            echo "ERROR: KSU_MANUAL_HOOK and KSU_SUSFS are mutually exclusive in this Kconfig choice."
             exit 1
           fi
 
