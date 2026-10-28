@@ -1,153 +1,149 @@
-name: Build ReSukiSU Kernel (Android 13 / equuleus)
+#!/usr/bin/env python3
+"""Adapt the existing ReSukiSU+SUSFS patch to the SDM845 LOS20 KSU backup branch.
 
-on:
-  workflow_dispatch:
-  schedule:
-    # Forks may need to enable scheduled workflows; manual Run workflow works independently.
-    - cron: '0 4 * * 0'
+This is a narrow compatibility transformation for:
+  Coconutat/android_kernel_xiaomi_sdm845_lineageos_Exp:lineageos-20-ksu-backup
+It deliberately does not rewrite SUSFS implementation code. It removes KSU registration
+hunks already present in that branch, omits the SELinux hunk whose KSU exception is
+already present there, and drops two VFS umount refactor hunks that do not exist in
+that older source layout. Hunk counts are recalculated after context adaptation.
+"""
+from __future__ import annotations
 
-permissions:
-  contents: read
+import re
+import sys
+from pathlib import Path
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      KERNEL_BRANCH: lineageos-20-ksu-backup
-      KERNEL_REPO: Coconutat/android_kernel_xiaomi_sdm845_lineageos_Exp
-      RESUKISU_REPO: ReSukiSU/ReSukiSU
-      DEVICE: equuleus
+OMIT_FILES = {
+    # The workflow builds this file from mi845_defconfig + equuleus.config itself.
+    "arch/arm64/configs/vendor/xiaomi/equuleus_defconfig",
+    # The workflow adapts the old input-hook references after applying the patch;
+    # omit the upstream input.c diff to avoid context mismatch on this older tree.
+    "drivers/input/input.c",
+    # These KSU registration lines already exist on lineageos-20-ksu-backup.
+    "drivers/Kconfig",
+    "drivers/Makefile",
+    # This branch already carries the equivalent KSU SELinux bypass code and CONFIG_KSU=y.
+    "security/selinux/hooks.c",
+}
+GUARD_ADAPT_FILES = {
+    "drivers/input/input.c",
+    "fs/exec.c",
+    "fs/read_write.c",
+}
+SKIP_NAMESPACE_HUNKS = (
+    "static inline bool may_mandlock",
+    "static int can_umount",
+)
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$")
 
-    steps:
-      - name: Checkout build scripts
-        uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y bc bison build-essential cpio device-tree-compiler flex git libelf-dev libssl-dev lz4 python3 zip
+def file_path(section: str) -> str | None:
+    match = re.search(r"(?m)^diff --git a/(.+?) b/(.+?)\s*$", section)
+    return match.group(2) if match else None
 
-      - name: Download toolchain
-        run: |
-          git clone --depth=1 https://github.com/PixelExperience/prebuilts_clang_kernel_linux-x86_clang-r416183b.git clang
-          git clone --depth=1 https://github.com/PixelExperience/prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc-aarch64
-          git clone --depth=1 https://github.com/PixelExperience/prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc-arm
 
-      - name: Clone Android 13 kernel base
-        run: |
-          git clone --depth=1 --single-branch --branch "$KERNEL_BRANCH" "https://github.com/$KERNEL_REPO.git" kernel
-          cd kernel
-          grep -q '^VERSION = 4' Makefile
-          grep -q '^PATCHLEVEL = 9' Makefile
-          grep -q '^SUBLEVEL = 337' Makefile
-          test -s arch/arm64/configs/vendor/xiaomi/equuleus.config
-          echo "Kernel source commit: $(git rev-parse HEAD)"
+def adapt_section(section: str) -> str | None:
+    path = file_path(section)
+    if path is None:
+        return section
+    if path in OMIT_FILES:
+        return None
 
-      - name: Clone ReSukiSU
-        run: git clone --depth=1 "https://github.com/$RESUKISU_REPO.git" resukisu
+    lines = section.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("@@ "):
+            out.append(line)
+            i += 1
+            continue
 
-      - name: Prepare LOS20-compatible patch
-        run: |
-          python3 -m py_compile scripts/prepare-lineage20-patch.py
-          python3 scripts/prepare-lineage20-patch.py \
-            patches/0001-resukisu-susfs-sdm845.patch \
-            "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
+        header = line
+        i += 1
+        body: list[str] = []
+        while i < len(lines) and not lines[i].startswith("@@ ") and not lines[i].startswith("diff --git "):
+            body.append(lines[i])
+            i += 1
 
-      - name: Apply patch and configure equuleus
-        run: |
-          cd kernel
-          git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-          git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-          python3 - <<'PY'
-          from pathlib import Path
+        if path == "fs/namespace.c" and (
+            any(marker in header for marker in SKIP_NAMESPACE_HUNKS)
+            or any(any(marker in item for marker in SKIP_NAMESPACE_HUNKS) for item in body)
+        ):
+            continue
 
-          p = Path("drivers/input/input.c")
-          s = p.read_text()
-          old_decl = "extern bool ksu_input_hook __read_mostly;"
-          new_decl = "extern struct static_key_true ksu_is_input_hook_enabled;"
-          old_cond = "if (unlikely(ksu_input_hook))"
-          new_cond = "if (static_branch_unlikely(&ksu_is_input_hook_enabled))"
-          jump_include = "#include <linux/jump_label.h>"
-          include_anchor = "#include <linux/input/mt.h>"
+        if path in GUARD_ADAPT_FILES:
+            # The LOS20 KSU backup branch has these old KernelSU hook declarations
+            # unguarded. Remove only old-side/context #ifdef/#endif lines; additions
+            # prefixed with '+' remain intact, including the new sys_read hook guard.
+            body = [
+                item for item in body
+                if not (
+                    item[:1] in (" ", "-")
+                    and item[1:].strip() in ("#ifdef CONFIG_KSU", "#endif")
+                )
+            ]
 
-          if s.count(old_decl) != 1 or s.count(old_cond) != 1:
-              raise SystemExit("ERROR: input hook source does not match expected layout")
-          s = s.replace(old_decl, new_decl, 1)
-          s = s.replace(old_cond, new_cond, 1)
-          if jump_include not in s:
-              if s.count(include_anchor) != 1:
-                  raise SystemExit("ERROR: cannot locate input header include anchor")
-              s = s.replace(include_anchor, include_anchor + "\n" + jump_include, 1)
-          p.write_text(s)
-          print("Updated input hook and jump-label include successfully")
-          PY
-          test ! -e drivers/kernelsu
-          ln -s "$GITHUB_WORKSPACE/resukisu/kernel" drivers/kernelsu
+        counts_old = sum(1 for item in body if item.startswith((" ", "-")))
+        counts_new = sum(1 for item in body if item.startswith((" ", "+")))
+        match = HUNK_RE.match(header)
+        if not match:
+            raise ValueError(f"Unsupported unified-diff hunk header: {header}")
+        old_start, new_start, tail = match.groups()
+        out.append(f"@@ -{old_start},{counts_old} +{new_start},{counts_new} @@{tail}")
+        out.extend(body)
 
-          cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig > arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
-          cat arch/arm64/configs/vendor/xiaomi/${DEVICE}.config >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
-          cat >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig <<'EOF'
-          # ReSukiSU + SUSFS: KSU_SUSFS is a mutually exclusive KSU hooking choice on this tree.
-          CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
-          EOF
+    return "\n".join(out) + "\n"
 
-      - name: Configure and verify required options
-        run: |
-          cd kernel
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE="$GITHUB_WORKSPACE/gcc-aarch64/bin/aarch64-linux-android-"
-          export CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc-arm/bin/arm-linux-androideabi-"
-          export LLVM=1 LLVM_IAS=1
-          export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
 
-          make O=out ARCH=arm64 vendor/xiaomi/${DEVICE}_defconfig CC=clang
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(f"Usage: {Path(sys.argv[0]).name} INPUT.patch OUTPUT.patch", file=sys.stderr)
+        return 2
 
-          echo "===== KSU configuration ====="
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_[A-Z0-9_]+|# CONFIG_KSU_[A-Z0-9_]+ is not set)' out/.config || true
+    source = Path(sys.argv[1])
+    destination = Path(sys.argv[2])
+    raw = source.read_text(encoding="utf-8")
+    sections = re.split(r"(?m)(?=^diff --git a/)", raw)
+    result: list[str] = []
+    removed_files: list[str] = []
+    skipped_hunks = 0
+    adjusted_sections = 0
 
-          if ! grep -qx 'CONFIG_KSU=y' out/.config; then
-            echo "ERROR: CONFIG_KSU is not enabled"
-            exit 1
-          fi
+    for section in sections:
+        if not section.strip():
+            continue
+        path = file_path(section)
+        if path in OMIT_FILES:
+            removed_files.append(path or "(unknown)")
+            continue
+        # Count and report skipped namespace refactor hunks for review.
+        if path == "fs/namespace.c":
+            before = sum(1 for line in section.splitlines() if line.startswith("@@ "))
+            after_section = adapt_section(section) or ""
+            after = sum(1 for line in after_section.splitlines() if line.startswith("@@ "))
+            skipped_hunks += before - after
+            result.append(after_section)
+            continue
+        adapted = adapt_section(section)
+        if adapted is not None:
+            if path in GUARD_ADAPT_FILES:
+                adjusted_sections += 1
+            result.append(adapted)
 
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
-            echo "ERROR: CONFIG_KSU_SUSFS is not enabled"
-            exit 1
-          fi
+    prepared = "".join(result)
+    # Ensure the adapted file is still a non-empty Git unified diff.
+    if not prepared.startswith("diff --git ") or "diff --git a/fs/susfs.c b/fs/susfs.c" not in prepared:
+        raise RuntimeError("Prepared patch failed structural sanity checks")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(prepared, encoding="utf-8")
+    print(f"Prepared patch: {destination} ({len(prepared)} bytes)")
+    print("Removed redundant/base-specific sections: " + ", ".join(removed_files))
+    print(f"Adapted hook sections: {adjusted_sections}; skipped incompatible umount refactor hunks: {skipped_hunks}")
+    print("Next step must run git apply --check before applying the patch.")
+    return 0
 
-          echo "KSU and KSU_SUSFS configuration checks passed."
 
-      - name: Build kernel
-        run: |
-          cd kernel
-          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE="$GITHUB_WORKSPACE/gcc-aarch64/bin/aarch64-linux-android-"
-          export CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc-arm/bin/arm-linux-androideabi-"
-          export LLVM=1 LLVM_IAS=1
-          export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-          make -j"$(nproc)" O=out ARCH=arm64 CC=clang
-          test -s out/arch/arm64/boot/Image.gz-dtb
-          ls -lh out/arch/arm64/boot/Image.gz-dtb
-
-      - name: Package equuleus AnyKernel3 ZIP
-        run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel3
-          rm -rf anykernel3/.git
-          cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel3/Image.gz-dtb
-          grep -q '^device.name1=' anykernel3/anykernel.sh
-          sed -i 's/^device.name1=.*/device.name1=equuleus/' anykernel3/anykernel.sh
-          sed -i 's/^supported.versions=.*/supported.versions=13/' anykernel3/anykernel.sh
-          (cd anykernel3 && zip -qr9 "$GITHUB_WORKSPACE/ReSukiSU-equuleus-AnyKernel3.zip" . -x '*.git*')
-          unzip -t ReSukiSU-equuleus-AnyKernel3.zip
-          sha256sum ReSukiSU-equuleus-AnyKernel3.zip
-
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ReSukiSU-equuleus-Android13-AnyKernel3
-          path: ReSukiSU-equuleus-AnyKernel3.zip
-          if-no-files-found: error
-          retention-days: 14
+if __name__ == "__main__":
+    raise SystemExit(main())
