@@ -67,20 +67,19 @@ jobs:
           new_decl = "extern struct static_key_true ksu_is_input_hook_enabled;"
           old_cond = "if (unlikely(ksu_input_hook))"
           new_cond = "if (static_branch_unlikely(&ksu_is_input_hook_enabled))"
-          jump_header = "#include <linux/jump_label.h>"
-          include_anchor = "#include <linux/idr.h>\n"
+          jump_include = "#include <linux/jump_label.h>"
+          include_anchor = "#include <linux/input/mt.h>"
 
           if s.count(old_decl) != 1 or s.count(old_cond) != 1:
               raise SystemExit("ERROR: input hook source does not match expected layout")
-
           s = s.replace(old_decl, new_decl, 1)
           s = s.replace(old_cond, new_cond, 1)
-          if jump_header not in s:
+          if jump_include not in s:
               if s.count(include_anchor) != 1:
-                  raise SystemExit("ERROR: cannot find include anchor for jump_label.h")
-              s = s.replace(include_anchor, include_anchor + jump_header + "\n", 1)
+                  raise SystemExit("ERROR: cannot locate input header include anchor")
+              s = s.replace(include_anchor, include_anchor + "\n" + jump_include, 1)
           p.write_text(s)
-          print("Updated input hook successfully")
+          print("Updated input hook and jump-label include successfully")
           PY
           test ! -e drivers/kernelsu
           ln -s "$GITHUB_WORKSPACE/resukisu/kernel" drivers/kernelsu
@@ -88,14 +87,9 @@ jobs:
           cat arch/arm64/configs/vendor/xiaomi/mi845_defconfig > arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
           cat arch/arm64/configs/vendor/xiaomi/${DEVICE}.config >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig
           cat >> arch/arm64/configs/vendor/xiaomi/${DEVICE}_defconfig <<'EOF'
-          # ReSukiSU + SUSFS
+          # ReSukiSU + SUSFS: KSU_SUSFS is a mutually exclusive KSU hooking choice on this tree.
           CONFIG_KSU=y
-          CONFIG_KSU_MANUAL_HOOK=y
-          # CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK is not set
-          # CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK is not set
-          # CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK is not set
           CONFIG_KSU_SUSFS=y
-          CONFIG_SUSFS=y
           EOF
 
       - name: Configure and verify required options
@@ -108,11 +102,13 @@ jobs:
           export LLVM=1 LLVM_IAS=1
           export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
           make O=out ARCH=arm64 vendor/xiaomi/${DEVICE}_defconfig CC=clang
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK|CONFIG_KSU_SUSFS|CONFIG_SUSFS)=' out/.config || true
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_SUS_PATH|CONFIG_KSU_SUSFS_SUS_MOUNT|CONFIG_KSU_SUSFS_SUS_KSTAT|CONFIG_KSU_SUSFS_SPOOF_UNAME)=' out/.config || true
           grep -qx 'CONFIG_KSU=y' out/.config
-          grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' out/.config
           grep -qx 'CONFIG_KSU_SUSFS=y' out/.config
-          grep -qx 'CONFIG_SUSFS=y' out/.config
+          if grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
+            echo 'ERROR: KSU_MANUAL_HOOK and KSU_SUSFS are mutually exclusive in this Kconfig choice.'
+            exit 1
+          fi
 
       - name: Build kernel
         run: |
