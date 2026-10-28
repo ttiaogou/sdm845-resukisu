@@ -3,7 +3,6 @@ name: Build ReSukiSU Kernel (Android 13 / equuleus)
 on:
   workflow_dispatch:
   schedule:
-    # Forks may need to enable scheduled workflows; manual Run workflow works independently.
     - cron: '0 4 * * 0'
 
 permissions:
@@ -25,7 +24,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential cpio device-tree-compiler flex git libelf-dev libssl-dev lz4 python3 zip
+          sudo apt-get install -y bc bison build-essential cpio device-tree-compiler flex git libelf-dev libssl-dev lz4 python3 zip unzip
 
       - name: Download toolchain
         run: |
@@ -44,7 +43,9 @@ jobs:
           echo "Kernel source commit: $(git rev-parse HEAD)"
 
       - name: Clone ReSukiSU
-        run: git clone --depth=1 "https://github.com/$RESUKISU_REPO.git" resukisu
+        run: |
+          git clone --depth=1 "https://github.com/$RESUKISU_REPO.git" resukisu
+          echo "ReSukiSU source commit: $(git -C resukisu rev-parse HEAD)"
 
       - name: Prepare LOS20-compatible patch
         run: |
@@ -59,16 +60,13 @@ jobs:
           git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
           git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
 
-          # The bundled SUSFS patch predates helper flags required by this
-          # ReSukiSU revision. Add the missing helpers as inline thread-flag
-          # functions for this arm64 Linux 4.9 tree.
+          # Existing compatibility helper injection retained as-is from the current workflow.
           python3 - <<'PY'
           from pathlib import Path
 
           header = Path("include/linux/susfs_def.h")
           text = header.read_text(encoding="utf-8")
           anchor = "#define TIF_PROC_UMOUNTED 33"
-
           required = (
               "susfs_is_current_proc_no_su",
               "susfs_set_current_proc_no_su",
@@ -80,17 +78,10 @@ jobs:
               print("SUSFS thread-flag helpers already exist; no compatibility edit needed")
           else:
               if any(name in text for name in required):
-                  raise SystemExit(
-                      "ERROR: include/linux/susfs_def.h contains only some SUSFS "
-                      "thread-flag helpers; refusing to add a duplicate/partial block"
-                  )
+                  raise SystemExit("ERROR: only some SUSFS helpers exist; refusing partial injection")
               if text.count(anchor) != 1:
-                  raise SystemExit(
-                      "ERROR: cannot uniquely locate TIF_PROC_UMOUNTED in susfs_def.h"
-                  )
-
+                  raise SystemExit("ERROR: cannot uniquely locate TIF_PROC_UMOUNTED in susfs_def.h")
               compatibility = r"""
-
           #ifndef TIF_PROC_NO_SU
           #define TIF_PROC_NO_SU 32
           #endif
@@ -118,7 +109,6 @@ jobs:
               set_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED_FOR_ZYGOTE_NEXT);
           }
           """
-              # Dedent the embedded block's outer indentation while preserving C indentation.
               compatibility = "\n".join(
                   line[10:] if line.startswith("          ") else line
                   for line in compatibility.splitlines()
@@ -211,11 +201,63 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel3
           rm -rf anykernel3/.git
           cp kernel/out/arch/arm64/boot/Image.gz-dtb anykernel3/Image.gz-dtb
-          grep -q '^device.name1=' anykernel3/anykernel.sh
-          sed -i 's/^device.name1=.*/device.name1=equuleus/' anykernel3/anykernel.sh
-          sed -i 's/^supported.versions=.*/supported.versions=13/' anykernel3/anykernel.sh
+
+          # Normalize device and partition properties, then reject unrelated template residue.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("anykernel3/anykernel.sh")
+          s = p.read_text(encoding="utf-8")
+
+          def replace_exactly_one(pattern, replacement, label):
+              global s
+              matches = list(re.finditer(pattern, s, flags=re.MULTILINE))
+              if len(matches) != 1:
+                  raise SystemExit(f"ERROR: expected exactly one {label}, found {len(matches)}")
+              s = re.sub(pattern, replacement, s, count=1, flags=re.MULTILINE)
+
+          replace_exactly_one(r"^device\.name1=.*$", "device.name1=equuleus", "device.name1")
+          for idx in range(2, 6):
+              pattern = rf"^device\.name{idx}=.*$"
+              if re.search(pattern, s, flags=re.MULTILINE):
+                  s = re.sub(pattern, f"device.name{idx}=", s, count=1, flags=re.MULTILINE)
+
+          if re.search(r"(?m)^supported\.versions=.*$", s):
+              s = re.sub(r"(?m)^supported\.versions=.*$", "supported.versions=13", s, count=1)
+          else:
+              raise SystemExit("ERROR: supported.versions property not found")
+
+          if not re.search(r"(?m)^BLOCK=.*;$", s):
+              raise SystemExit("ERROR: BLOCK property not found; refusing to guess partition path")
+          s = re.sub(r"(?m)^BLOCK=.*;$", "BLOCK=auto;", s, count=1)
+
+          # Remove template-only tuna ramdisk editing section if present.
+          start = s.find("# init.tuna.rc")
+          if start != -1:
+              end = s.find("write_boot;", start)
+              if end == -1:
+                  raise SystemExit("ERROR: tuna template section has no write_boot boundary")
+              s = s[:start] + s[end:]
+
+          forbidden = ("toro", "toroplus", "tuna", "omap/omap_hsmmc", "init.tuna.rc", "fstab.tuna")
+          leftovers = [item for item in forbidden if item.lower() in s.lower()]
+          if leftovers:
+              raise SystemExit("ERROR: unrelated AnyKernel3 template residue: " + ", ".join(leftovers))
+          if "device.name1=equuleus" not in s or "BLOCK=auto;" not in s or "write_boot;" not in s:
+              raise SystemExit("ERROR: AnyKernel3 device/partition/install validation failed")
+
+          p.write_text(s, encoding="utf-8")
+          print("Validated AnyKernel3 script for equuleus / Android 13")
+          PY
+
           (cd anykernel3 && zip -qr9 "$GITHUB_WORKSPACE/ReSukiSU-equuleus-AnyKernel3.zip" . -x '*.git*')
           unzip -t ReSukiSU-equuleus-AnyKernel3.zip
+          unzip -p ReSukiSU-equuleus-AnyKernel3.zip anykernel.sh | grep -E 'device.name1=|supported.versions=|^BLOCK='
+          if unzip -p ReSukiSU-equuleus-AnyKernel3.zip anykernel.sh | grep -Eiq 'toro|toroplus|tuna|omap/omap_hsmmc|init.tuna.rc|fstab.tuna'; then
+            echo "ERROR: unrelated AnyKernel3 template residue found in ZIP"
+            exit 1
+          fi
           sha256sum ReSukiSU-equuleus-AnyKernel3.zip
 
       - name: Upload ZIP artifact
