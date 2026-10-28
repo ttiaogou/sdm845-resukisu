@@ -92,8 +92,8 @@ jobs:
           CONFIG_KSU_SUSFS=y
           EOF
 
-          - name: Configure and verify required options
-           run: |
+      - name: Configure and verify required options
+        run: |
           cd kernel
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export CLANG_TRIPLE=aarch64-linux-gnu-
@@ -101,25 +101,15 @@ jobs:
           export CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/gcc-arm/bin/arm-linux-androideabi-"
           export LLVM=1 LLVM_IAS=1
           export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
-
           make O=out ARCH=arm64 vendor/xiaomi/${DEVICE}_defconfig CC=clang
-
-          echo "===== KSU configuration ====="
-          grep -E '^(CONFIG_KSU|CONFIG_KSU_[A-Z0-9_]+|# CONFIG_KSU_[A-Z0-9_]+ is not set)' out/.config || true
-
-          if ! grep -qx 'CONFIG_KSU=y' out/.config; then
-            echo "ERROR: CONFIG_KSU is not enabled"
+          grep -E '^(CONFIG_KSU|CONFIG_KSU_SUSFS|CONFIG_KSU_SUSFS_SUS_PATH|CONFIG_KSU_SUSFS_SUS_MOUNT|CONFIG_KSU_SUSFS_SUS_KSTAT|CONFIG_KSU_SUSFS_SPOOF_UNAME)=' out/.config || true
+          grep -qx 'CONFIG_KSU=y' out/.config
+          grep -qx 'CONFIG_KSU_SUSFS=y' out/.config
+          if grep -qx 'CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
+            echo 'ERROR: KSU_MANUAL_HOOK and KSU_SUSFS are mutually exclusive in this Kconfig choice.'
             exit 1
           fi
 
-          if ! grep -qx 'CONFIG_KSU_SUSFS=y' out/.config; then
-            echo "ERROR: CONFIG_KSU_SUSFS is not enabled"
-            exit 1
-          fi
-
-          echo "KSU and KSU_SUSFS configuration checks passed."
-
-          
       - name: Build kernel
         run: |
           cd kernel
