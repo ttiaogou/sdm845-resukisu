@@ -22,6 +22,7 @@ OMIT_FILES = {
     "drivers/Makefile",
     # This branch already carries the equivalent KSU SELinux bypass code and CONFIG_KSU=y.
     "security/selinux/hooks.c",
+    "drivers/input/input.c",
 }
 GUARD_ADAPT_FILES = {
     "drivers/input/input.c",
