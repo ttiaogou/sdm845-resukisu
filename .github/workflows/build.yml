@@ -58,7 +58,7 @@ jobs:
           cd kernel
           git apply --check "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
           git apply "$RUNNER_TEMP/lineage20-resukisu-susfs.patch"
-                    python3 - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
 
           p = Path("drivers/input/input.c")
@@ -67,12 +67,18 @@ jobs:
           new_decl = "extern struct static_key_true ksu_is_input_hook_enabled;"
           old_cond = "if (unlikely(ksu_input_hook))"
           new_cond = "if (static_branch_unlikely(&ksu_is_input_hook_enabled))"
+          jump_header = "#include <linux/jump_label.h>"
+          include_anchor = "#include <linux/idr.h>\n"
 
           if s.count(old_decl) != 1 or s.count(old_cond) != 1:
               raise SystemExit("ERROR: input hook source does not match expected layout")
 
           s = s.replace(old_decl, new_decl, 1)
           s = s.replace(old_cond, new_cond, 1)
+          if jump_header not in s:
+              if s.count(include_anchor) != 1:
+                  raise SystemExit("ERROR: cannot find include anchor for jump_label.h")
+              s = s.replace(include_anchor, include_anchor + jump_header + "\n", 1)
           p.write_text(s)
           print("Updated input hook successfully")
           PY
