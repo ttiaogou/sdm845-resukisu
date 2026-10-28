@@ -29,7 +29,7 @@ jobs:
           SKIP=false
           if gh release view latest --repo ${{ github.repository }} >/dev/null 2>&1; then
             OLD_SHA=$(gh release view latest --repo ${{ github.repository }} --json body -q .body | grep -oP 'ReSukiSU: \K[0-9a-f]{7}' | head -1 || true)
-            if [ -n "$OLD_SHA" ] && [ "$OLD_SHA" = "${NEW_SHA:0:7}" ]; then
+            if [ "${{ github.event_name }}" = "schedule" ] && [ -n "$OLD_SHA" ] && [ "$OLD_SHA" = "${NEW_SHA:0:7}" ]; then
               SKIP=true
               echo "上游无更新，跳过构建"
             fi
